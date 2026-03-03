@@ -1,0 +1,68 @@
+name: Daily Backtest & Email
+
+on:
+  schedule:
+    # 下面範例是每天 16:00 UTC（相當於美西時區 08:00 PST）
+    - cron: '0 16 * * *'
+  workflow_dispatch: {}  # 手動觸發用，測試很方便
+
+jobs:
+  run-and-mail:
+    runs-on: ubuntu-latest
+    env:
+      OUT_DIR: multi_param_outputs
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install system deps (optional, speeds up some libs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Install pip requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backtest script
+        id: run_script
+        run: |
+          set -e
+          python multi_ticker_param_recommend.py
+
+      - name: List outputs for debug
+        run: |
+          echo "Contents of OUT_DIR:"
+          ls -la ${{ env.OUT_DIR }} || true
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: ${{ env.OUT_DIR }}
+
+      - name: Send results by email (SMTP)
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: Daily Trading Recommendations - ${{ github.repository }} - ${{ github.run_date }}
+          # 若要寄 HTML 與 CSV，附上整個目錄（會把每個檔案列為附件）
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+          # 內文簡短
+          body: |
+            Hi,
+            Attached are today's backtest / recommendation outputs (CSV + HTML).
+            Repo: ${{ github.repository }}
+          attach: ${{ env.OUT_DIR }}/*
+          secure: true
