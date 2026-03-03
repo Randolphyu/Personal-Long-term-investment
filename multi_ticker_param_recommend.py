@@ -42,7 +42,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # -------------------- 使用者參數 (可調) --------------------
-TICKERS = ["AAPL","NVDA","GOOG","VOO","TSLA","NFLX"]
+TICKERS = ["NFLX"]#"AAPL","NVDA","GOOG","VOO","TSLA",
 START_DATE = "2024-01-01"
 FREQ = "1d"
 
