@@ -102,7 +102,9 @@ def extract_ohlcv(df):
                 s = df[k]
                 return pd.Series(s.values, index=df.index).dropna() if not isinstance(s, pd.Series) else s.dropna()
         return None
-    close  = col("Close") or col("Adj Close")
+    close  = col("Close")
+    if close is None:
+        close = col("Adj Close")
     if close is None:
         return None, None, None, None, None
     idx    = close.index
