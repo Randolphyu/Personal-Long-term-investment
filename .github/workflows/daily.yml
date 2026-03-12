@@ -12,7 +12,8 @@ jobs:
   run-and-mail:
     runs-on: ubuntu-latest
     env:
-      OUT_DIR: multi_param_outputs
+      OUT_DIR_1: multi_param_outputs
+      OUT_DIR_2: expand_multi_param_outputs
 
     steps:
       - name: Checkout repo
@@ -35,26 +36,81 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run backtest script
+      - name: Run multi_ticker_param_recommend.py
         run: python multi_ticker_param_recommend.py
 
-      - name: Upload CSV as artifact
+      - name: Run expand_multi_ticker_param_recommend.py
+        run: python expand_multi_ticker_param_recommend.py
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results-${{ github.run_id }}
-          path: ${{ env.OUT_DIR }}/recommendations.csv
+          path: |
+            ${{ env.OUT_DIR_1 }}/recommendations.csv
+            ${{ env.OUT_DIR_2 }}/recommendations.csv
           retention-days: 7
 
-      - name: Send recommendations by email
+      - name: Merge email bodies
+        run: |
+          python - << 'PYEOF'
+          import os
+
+          file1 = os.path.join(os.environ["OUT_DIR_1"], "email_body.html")
+          file2 = os.path.join(os.environ["OUT_DIR_2"], "email_body.html")
+
+          def read(path):
+              if not os.path.exists(path):
+                  return f"<p style='color:red'>File not found: {path}</p>"
+              with open(path, encoding="utf-8") as f:
+                  content = f.read()
+              # 取 <body> 內容
+              start = content.find("<body")
+              end   = content.find("</body>")
+              if start != -1 and end != -1:
+                  return content[content.find(">", start)+1 : end]
+              return content
+
+          body1 = read(file1)
+          body2 = read(file2)
+
+          merged = f"""
+          <html><body style="font-family:Arial;padding:16px">
+          <h1 style="border-bottom:2px solid #343a40;padding-bottom:8px">
+            📊 Daily Backtest Report
+          </h1>
+
+          <h2 style="margin-top:32px;color:#343a40">
+            🔹 Strategy 1 — multi_ticker_param_recommend
+          </h2>
+          {body1}
+
+          <hr style="margin:40px 0;border:1px solid #dee2e6">
+
+          <h2 style="color:#343a40">
+            🔹 Strategy 2 — expand_multi_ticker_param_recommend
+          </h2>
+          {body2}
+
+          </body></html>
+          """
+
+          out = "combined_email_body.html"
+          with open(out, "w", encoding="utf-8") as f:
+              f.write(merged)
+          print(f"Saved -> {out}")
+          PYEOF
+
+      - name: Send combined email
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.SMTP_HOST }}
           server_port:    ${{ secrets.SMTP_PORT }}
           username:       ${{ secrets.SMTP_USERNAME }}
           password:       ${{ secrets.SMTP_PASSWORD }}
-          subject:        "📈 Daily Trading Recommendations - ${{ github.run_id }}"
+          subject:        "📊 Daily Backtest Report - ${{ github.run_id }}"
           to:             ${{ secrets.EMAIL_TO }}
           from:           ${{ secrets.SMTP_USERNAME }}
-          html_body:      file://${{ env.OUT_DIR }}/email_body.html
+          html_body:      file://combined_email_body.html
           secure: true
