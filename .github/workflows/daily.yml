@@ -2,8 +2,8 @@ name: Daily Backtest & Email
 
 on:
   schedule:
-    - cron: '0 16 * * *'   # 每天 16:00 UTC（美西 08:00 PST）
-  workflow_dispatch: {}     # 手動觸發
+    - cron: '0 16 * * *'
+  workflow_dispatch: {}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -28,8 +28,7 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -39,19 +38,15 @@ jobs:
       - name: Run backtest script
         run: python multi_ticker_param_recommend.py
 
-      - name: List outputs (debug)
-        if: always()
-        run: ls -la ${{ env.OUT_DIR }} || echo "No output directory found"
-
-      - name: Upload results as artifact
+      - name: Upload CSV as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results-${{ github.run_id }}
-          path: ${{ env.OUT_DIR }}
+          path: ${{ env.OUT_DIR }}/recommendations.csv
           retention-days: 7
 
-      - name: Send results by email
+      - name: Send recommendations by email
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.SMTP_HOST }}
@@ -64,9 +59,9 @@ jobs:
           body: |
             Hi,
 
-            Attached are today's backtest / recommendation outputs (CSV + HTML charts).
+            Attached is today's trading recommendation table (CSV).
 
             Repo : ${{ github.repository }}
             Run  : ${{ github.run_id }}
-          attachments: ${{ env.OUT_DIR }}/*
+          attachments: ${{ env.OUT_DIR }}/recommendations.csv
           secure: true
