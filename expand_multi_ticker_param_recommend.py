@@ -1,11 +1,11 @@
 # multi_ticker_param_recommend.py
 # -*- coding: utf-8 -*-
 """
-策略版本：Walk-Forward Optimization (WFO)
-- 滾動訓練窗口，參數每次自動更新，不依賴固定 Train/Test 切割
-- WFO 統計跨窗口平均表現，用來評估策略是否真的有效
-- 最後一個訓練窗口找出的參數 → 今日建議
-- SPY 市場狀態過濾、相對強度輪動、量能確認、時間止損
+中線波段策略（2~6週）
+進場：50MA趨勢過濾 + 爆量突破 + K棒強度 三層確認
+出場：ATR trailing stop + K線反轉訊號（任一先到即出場）
+驗證：固定 Train/Test 切割
+選股：21檔（個股+板塊ETF+防禦）+ SPY市場狀態 + 動能輪動前5
 """
 import gc
 import os
@@ -16,7 +16,6 @@ import vectorbt as vbt
 import yfinance as yf
 from tqdm import tqdm
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 
 # ================================================================
 #  使用者參數
@@ -30,27 +29,37 @@ UNIVERSE = {
 TICKERS    = [t for g in UNIVERSE.values() for t in g]
 SPY_TICKER = "SPY"
 
-# --- Walk-Forward 設定 ---
-WFO_START        = "2020-01-01"   # 整個回測起點（要夠長才有足夠窗口）
-WFO_TRAIN_MONTHS = 12             # 每個訓練窗口長度（月）
-WFO_TEST_MONTHS  = 3              # 每個測試窗口長度（月）
-# 今日建議用的訓練窗口 = 最近 WFO_TRAIN_MONTHS 個月
+# --- 時間切割 ---
+TRAIN_START = "2021-01-01"
+TRAIN_END   = "2023-12-31"
+TEST_START  = "2024-01-01"
 
-# --- 策略參數 grid ---
-MA_LENS      = [10, 15, 20, 30, 50]
-ATR_MULTS    = [1.5, 2.0, 2.5, 3.0]
-ATR_LEN      = 14
-LONG_MA_LEN  = 200
+# --- 進場參數 grid（train 期間掃這些組合）---
+TREND_MA_LENS   = [30, 50]          # 趨勢均線
+TREND_SLOPE_WIN = 10                # 均線斜率計算窗口（天）
+VOL_MULT_LIST   = [1.3, 1.5, 2.0]  # 爆量門檻（相對20日均量倍數）
+BODY_RATIO_LIST = [0.5, 0.6, 0.7]  # K棒實體比例門檻
+CLOSE_TOP_LIST  = [0.20, 0.25]     # 收盤在當天高點前 N% 以內
 
-# --- 輪動設定 ---
-MOMENTUM_WINDOW   = 60
-TOP_N_TICKERS     = 5
-MIN_AVG_TEST_PF   = 1.2   # WFO 各窗口平均 Profit Factor 門檻
+# --- 出場參數 ---
+ATR_LEN       = 14
+ATR_MULT_LIST = [1.5, 2.0, 2.5]    # ATR trailing stop 倍數
+MAX_HOLD_DAYS = 30                  # 時間止損
 
-# --- 出場 ---
-MAX_HOLD_DAYS = 30
+# K線反轉：射擊之星 / 吞噬
+UPPER_SHADOW_RATIO = 2.0   # 上影線 > 實體 N 倍 → 反轉訊號
+ENGULF_RATIO       = 1.0   # 陰線實體 > 前陽線實體 N 倍 → 吞噬
+WEAK_VOL_DAYS      = 3     # 連續縮量陰線天數
 
-# --- 回測參數 ---
+# --- 輪動 ---
+MOMENTUM_WINDOW = 60
+TOP_N_TICKERS   = 5
+
+# --- 驗證門檻 ---
+MIN_TEST_PF   = 1.2
+MIN_TRADES    = 3     # 測試期至少要有幾筆交易才算有效
+
+# --- 回測 ---
 INIT_CASH       = 800
 COMMISSION      = 0.002
 SIZE_HACK_VALUE = 100000
@@ -59,7 +68,6 @@ SIZE_HACK_VALUE = 100000
 OUT_DIR        = "multi_param_outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
 RECOMMEND_CSV  = os.path.join(OUT_DIR, "recommendations.csv")
-WFO_CSV        = os.path.join(OUT_DIR, "wfo_summary.csv")
 HTML_BODY_FILE = os.path.join(OUT_DIR, "email_body.html")
 
 
@@ -67,58 +75,42 @@ HTML_BODY_FILE = os.path.join(OUT_DIR, "email_body.html")
 #  工具函式
 # ================================================================
 
-def safe_download_series(ticker, start, end=None):
+def safe_download(ticker, start, end=None):
+    """下載 OHLCV，回傳 DataFrame 或 None"""
     kwargs = {"start": start, "interval": "1d", "progress": False}
     if end:
         kwargs["end"] = end
     try:
-        data = vbt.YFData.download(
-            ticker, start=start, **( {"end": end} if end else {} ), interval="1d"
-        )
+        df = yf.download(ticker, **kwargs)
+        if df is None or df.empty:
+            raise ValueError("empty")
+        # 有時候 yfinance 回傳 MultiIndex columns
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
     except Exception:
-        data = None
-    if data is None:
-        try:
-            data = yf.download(ticker, **kwargs)
-        except Exception:
-            return None, None, None, None
-
-    def get_field(obj, key):
-        if hasattr(obj, "get"):
-            try:
-                r = obj.get(key)
-                if r is not None:
-                    return r
-            except Exception:
-                pass
-        if isinstance(obj, pd.DataFrame) and key in obj.columns:
-            return obj[key]
         return None
 
-    open_s  = get_field(data, "Open")
-    high_s  = get_field(data, "High")
-    low_s   = get_field(data, "Low")
-    close_s = get_field(data, "Close")
-    if close_s is None and isinstance(data, pd.DataFrame) and "Adj Close" in data.columns:
-        close_s = data["Adj Close"]
-    if close_s is None:
-        return None, None, None, None
 
-    close_s = pd.Series(close_s).dropna()
-    if open_s is not None: open_s = pd.Series(open_s).reindex(close_s.index)
-    if high_s is not None: high_s = pd.Series(high_s).reindex(close_s.index)
-    if low_s  is not None: low_s  = pd.Series(low_s ).reindex(close_s.index)
-    return open_s, high_s, low_s, close_s
-
-
-def safe_download_volume(ticker, start, end=None):
-    try:
-        df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
-        if "Volume" in df.columns:
-            return pd.Series(df["Volume"]).dropna()
-    except Exception:
-        pass
-    return None
+def extract_ohlcv(df):
+    """從 DataFrame 取出乾淨的 open/high/low/close/volume Series"""
+    if df is None:
+        return None, None, None, None, None
+    def col(key):
+        for k in [key, key.lower(), key.capitalize()]:
+            if k in df.columns:
+                s = df[k]
+                return pd.Series(s.values, index=df.index).dropna() if not isinstance(s, pd.Series) else s.dropna()
+        return None
+    close  = col("Close") or col("Adj Close")
+    if close is None:
+        return None, None, None, None, None
+    idx    = close.index
+    open_s = col("Open");  open_s  = open_s.reindex(idx)  if open_s  is not None else pd.Series(np.nan, index=idx)
+    high_s = col("High");  high_s  = high_s.reindex(idx)  if high_s  is not None else pd.Series(np.nan, index=idx)
+    low_s  = col("Low");   low_s   = low_s.reindex(idx)   if low_s   is not None else pd.Series(np.nan, index=idx)
+    vol    = col("Volume"); vol    = vol.reindex(idx)      if vol     is not None else pd.Series(np.nan, index=idx)
+    return open_s, high_s, low_s, close, vol
 
 
 def try_attr(obj, names):
@@ -127,41 +119,232 @@ def try_attr(obj, names):
     for n in names:
         if hasattr(obj, n):
             return getattr(obj, n)
-    try:
-        return pd.Series(obj)
-    except Exception as e:
-        raise AttributeError(f"Indicator object missing {names}: {e}")
+    return pd.Series(obj)
 
 
-def compute_trail_numpy(close_arr, atr_arr, entries_arr, atr_mult, max_hold_days=None):
-    n = len(close_arr)
-    trail = np.full(n, np.nan)
-    exits = np.zeros(n, dtype=bool)
-    in_pos, cur_trail, entry_day, peak = False, np.nan, 0, np.nan
+# ================================================================
+#  進場訊號計算
+# ================================================================
+
+def compute_entry_signals(open_s, high_s, low_s, close, vol,
+                           trend_ma_len, vol_mult, body_ratio, close_top):
+    """
+    三層進場條件：
+    1. 趨勢：close > trend_MA 且 MA 斜率向上
+    2. 爆量突破：volume > vol_mult * vol_MA20
+    3. K棒強度：實體 > body_ratio * 全棒，收在高點 close_top 以內，收紅
+    """
+    # 趨勢均線
+    ma_run    = vbt.MA.run(close, window=trend_ma_len, ewm=False)
+    trend_ma  = try_attr(ma_run, ["ma", "real", "value", "output"])
+    if isinstance(trend_ma, pd.DataFrame): trend_ma = trend_ma.iloc[:, 0]
+    trend_ma  = trend_ma.reindex(close.index)
+    ma_slope  = trend_ma.diff(TREND_SLOPE_WIN)          # 正值 = 向上
+
+    # 成交量均線
+    vol_ma20  = vol.rolling(20).mean()
+
+    # --- 條件 1: 趨勢 ---
+    cond_trend = (close > trend_ma) & (ma_slope > 0)
+
+    # --- 條件 2: 爆量 ---
+    cond_vol   = vol > vol_mult * vol_ma20
+
+    # --- 條件 3: K棒強度 ---
+    full_range = high_s - low_s                         # 全棒長度
+    body       = (close - open_s).abs()                 # 實體大小
+    upper_wick = high_s - close.where(close >= open_s, open_s)  # 上影線
+    cond_body  = (body / full_range.replace(0, np.nan)) >= body_ratio
+    cond_top   = (high_s - close) / full_range.replace(0, np.nan) <= close_top
+    cond_bull  = close > open_s                         # 收紅
+
+    entries = (cond_trend & cond_vol & cond_body & cond_top & cond_bull)
+    entries = entries.fillna(False).astype(bool)
+    return entries
+
+
+# ================================================================
+#  出場訊號計算
+# ================================================================
+
+def compute_exit_signals(open_s, high_s, low_s, close, vol,
+                          atr, atr_mult, entries):
+    """
+    雙重出場條件：
+    1. ATR trailing stop
+    2. K線反轉訊號（射擊之星 / 吞噬 / 縮量陰線連續）
+    任一先到即出場
+    """
+    n          = len(close)
+    close_arr  = close.values
+    open_arr   = open_s.values
+    high_arr   = high_s.values
+    low_arr    = low_s.values
+    vol_arr    = vol.values
+    atr_arr    = atr.values
+    entry_arr  = entries.values
+
+    trail  = np.full(n, np.nan)
+    exits  = np.zeros(n, dtype=bool)
+    in_pos = False
+    cur_trail, entry_day, peak = np.nan, 0, np.nan
+    consec_weak = 0   # 連續縮量陰線計數
+
+    vol_ma20 = pd.Series(vol_arr).rolling(20).mean().values
 
     for i in range(1, n):
         if np.isnan(atr_arr[i]):
             continue
-        if entries_arr[i] and not in_pos:
-            in_pos, entry_day, peak = True, i, close_arr[i]
-            cur_trail = close_arr[i] - atr_arr[i] * atr_mult
-            trail[i]  = cur_trail
-        elif in_pos:
+
+        if entry_arr[i] and not in_pos:
+            in_pos     = True
+            entry_day  = i
+            peak       = close_arr[i]
+            cur_trail  = close_arr[i] - atr_arr[i] * atr_mult
+            trail[i]   = cur_trail
+            consec_weak = 0
+            continue
+
+        if in_pos:
             if close_arr[i] > peak:
                 peak = close_arr[i]
+
+            # 更新 ATR trailing stop
             cur_trail = max(cur_trail, close_arr[i] - atr_arr[i] * atr_mult)
             trail[i]  = cur_trail
-            # 出場 1: ATR trailing stop
+
+            # --- 出場 1: ATR trailing stop ---
             if close_arr[i] < cur_trail:
                 exits[i] = True
                 in_pos, cur_trail = False, np.nan
                 continue
-            # 出場 2: 時間止損（超過 max_hold_days 且未明顯創新高）
-            if max_hold_days and (i - entry_day) >= max_hold_days:
-                if close_arr[i] <= peak * 0.995:
-                    exits[i] = True
-                    in_pos, cur_trail = False, np.nan
-    return trail, exits
+
+            # --- 出場 2: 時間止損 ---
+            if (i - entry_day) >= MAX_HOLD_DAYS and close_arr[i] <= peak * 0.995:
+                exits[i] = True
+                in_pos, cur_trail = False, np.nan
+                continue
+
+            # --- 出場 3: K線反轉 ---
+            full   = high_arr[i] - low_arr[i]
+            body   = abs(close_arr[i] - open_arr[i])
+            upper  = high_arr[i] - max(close_arr[i], open_arr[i])
+
+            # 射擊之星 / 墓碑：上影線 > 實體 N 倍，收在低位
+            is_shooting_star = (
+                full > 0 and body > 0 and
+                upper >= UPPER_SHADOW_RATIO * body and
+                (close_arr[i] - low_arr[i]) / full <= 0.35
+            )
+
+            # 吞噬陰線：今天陰線實體 > 昨天陽線實體
+            prev_body = abs(close_arr[i-1] - open_arr[i-1])
+            is_bearish_engulf = (
+                close_arr[i] < open_arr[i] and           # 今收陰
+                close_arr[i-1] > open_arr[i-1] and       # 昨收陽
+                body >= ENGULF_RATIO * prev_body and      # 今實體 >= 昨實體
+                close_arr[i] < open_arr[i-1]             # 今收 < 昨開
+            )
+
+            # 縮量陰線
+            is_weak_bear = (
+                close_arr[i] < open_arr[i] and
+                not np.isnan(vol_ma20[i]) and
+                vol_arr[i] < vol_ma20[i] * 0.8
+            )
+            consec_weak = (consec_weak + 1) if is_weak_bear else 0
+            is_vol_exhaustion = (consec_weak >= WEAK_VOL_DAYS)
+
+            if is_shooting_star or is_bearish_engulf or is_vol_exhaustion:
+                exits[i] = True
+                in_pos, cur_trail = False, np.nan
+                consec_weak = 0
+                continue
+
+    return pd.Series(trail, index=close.index), pd.Series(exits, index=close.index)
+
+
+# ================================================================
+#  單一 ticker param grid
+# ================================================================
+
+def run_param_grid(ticker, open_s, high_s, low_s, close, vol):
+    """跑完整 param grid，回傳 results list"""
+    if close is None or len(close) < 80:
+        return []
+
+    atr_run = vbt.ATR.run(high_s, low_s, close, window=ATR_LEN)
+    atr = try_attr(atr_run, ["atr", "real", "value", "output"])
+    if isinstance(atr, pd.DataFrame): atr = atr.iloc[:, 0]
+    atr = atr.reindex(close.index)
+
+    results = []
+    for trend_ma_len in TREND_MA_LENS:
+        for vol_mult in VOL_MULT_LIST:
+            for body_ratio in BODY_RATIO_LIST:
+                for close_top in CLOSE_TOP_LIST:
+                    entries = compute_entry_signals(
+                        open_s, high_s, low_s, close, vol,
+                        trend_ma_len, vol_mult, body_ratio, close_top
+                    )
+                    n_entry = entries.sum()
+                    if n_entry == 0:
+                        continue
+
+                    for atr_mult in ATR_MULT_LIST:
+                        _, exits = compute_exit_signals(
+                            open_s, high_s, low_s, close, vol,
+                            atr, atr_mult, entries
+                        )
+                        pf = vbt.Portfolio.from_signals(
+                            close=close,
+                            entries=entries,
+                            exits=exits,
+                            init_cash=INIT_CASH,
+                            fees=COMMISSION,
+                            size=SIZE_HACK_VALUE,
+                            direction="longonly",
+                            freq="1d"
+                        )
+                        stats    = pf.stats()
+                        pfactor  = stats.get("Profit Factor")    if "Profit Factor"    in stats.index else np.nan
+                        ret      = stats.get("Total Return [%]") if "Total Return [%]" in stats.index else np.nan
+                        max_dd   = stats.get("Max Drawdown [%]") if "Max Drawdown [%]" in stats.index else np.nan
+                        n_trades = stats.get("Total Trades")     if "Total Trades"     in stats.index else 0
+                        sharpe   = stats.get("Sharpe ratio")     if "Sharpe ratio"     in stats.index else np.nan
+                        del pf
+
+                        results.append({
+                            "ticker":       ticker,
+                            "trend_ma":     trend_ma_len,
+                            "vol_mult":     vol_mult,
+                            "body_ratio":   body_ratio,
+                            "close_top":    close_top,
+                            "atr_mult":     atr_mult,
+                            "profit_factor":float(pfactor)  if not pd.isna(pfactor)  else np.nan,
+                            "total_return": float(ret)      if not pd.isna(ret)       else np.nan,
+                            "max_drawdown": float(max_dd)   if not pd.isna(max_dd)    else np.nan,
+                            "n_trades":     int(n_trades)   if not pd.isna(n_trades)  else 0,
+                            "sharpe":       float(sharpe)   if not pd.isna(sharpe)    else np.nan,
+                        })
+
+    gc.collect()
+    return results
+
+
+def get_market_regime(spy_close):
+    if spy_close is None or len(spy_close) < 200:
+        return "unknown"
+    ma200 = spy_close.rolling(200).mean()
+    if pd.isna(ma200.iloc[-1]):
+        return "unknown"
+    return "risk-on" if spy_close.iloc[-1] > ma200.iloc[-1] else "risk-off"
+
+
+def compute_momentum_score(close, window=60):
+    if close is None or len(close) < window + 1:
+        return np.nan
+    return (close.iloc[-1] - close.iloc[-window]) / close.iloc[-window]
 
 
 def compute_in_position(entries, exits):
@@ -174,170 +357,34 @@ def compute_in_position(entries, exits):
     return in_pos, last_entry_idx
 
 
-def get_market_regime(spy_close):
-    if spy_close is None or len(spy_close) < LONG_MA_LEN:
-        return "unknown"
-    ma200      = spy_close.rolling(LONG_MA_LEN).mean()
-    last_ma200 = ma200.iloc[-1]
-    if pd.isna(last_ma200):
-        return "unknown"
-    return "risk-on" if spy_close.iloc[-1] > last_ma200 else "risk-off"
-
-
-def compute_momentum_score(close, window=60):
-    if close is None or len(close) < window + 1:
-        return np.nan
-    return (close.iloc[-1] - close.iloc[-window]) / close.iloc[-window]
-
-
-def run_param_grid(ticker, close, high_s, low_s, ma_lens, atr_mults):
-    """
-    對已載入的 OHLC 跑完整 param grid，回傳 DataFrame
-    """
-    if close is None or len(close) < 60:
-        return pd.DataFrame()
-
-    atr_run = vbt.ATR.run(high_s, low_s, close, window=ATR_LEN)
-    atr = try_attr(atr_run, ["atr", "real", "value", "output"])
-    if isinstance(atr, pd.DataFrame): atr = atr.iloc[:, 0]
-    atr = atr.reindex(close.index)
-
-    long_ma_run = vbt.MA.run(close, window=LONG_MA_LEN, ewm=False)
-    long_ma = try_attr(long_ma_run, ["ma", "real", "value", "output"])
-    if isinstance(long_ma, pd.DataFrame): long_ma = long_ma.iloc[:, 0]
-    long_ma = long_ma.reindex(close.index)
-
-    ma_run = vbt.MA.run(close, window=ma_lens, ewm=False)
-    ma_all = try_attr(ma_run, ["ma", "real", "value", "output"])
-    if isinstance(ma_all, pd.Series):
-        ma_all = ma_all.to_frame(name=str(ma_lens[0]))
-    try:
-        if len(ma_all.columns) == len(ma_lens):
-            ma_all.columns = [str(int(w)) for w in ma_lens]
-    except Exception:
-        pass
-
-    close_df = pd.DataFrame(
-        np.repeat(close.values[:, None], ma_all.shape[1], axis=1),
-        index=close.index, columns=ma_all.columns
-    )
-    entries_df = (close_df > ma_all) & (close_df.shift(1) <= ma_all.shift(1))
-    entries_df = entries_df.fillna(False).astype(bool)
-    long_df = pd.DataFrame(
-        np.repeat(long_ma.values[:, None], ma_all.shape[1], axis=1),
-        index=close.index, columns=ma_all.columns
-    )
-    entries_df &= (close_df > long_df)
-    del long_df
-
-    close_arr = close.values
-    atr_arr   = atr.values
-    results   = []
-
-    for atr_mult in atr_mults:
-        for col in ma_all.columns:
-            entries_arr = entries_df[col].values
-            trail_arr, exits_arr = compute_trail_numpy(
-                close_arr, atr_arr, entries_arr, atr_mult, MAX_HOLD_DAYS
-            )
-            pf = vbt.Portfolio.from_signals(
-                close=close,
-                entries=pd.Series(entries_arr, index=close.index),
-                exits=pd.Series(exits_arr,     index=close.index),
-                init_cash=INIT_CASH, fees=COMMISSION,
-                size=SIZE_HACK_VALUE, direction="longonly", freq="1d"
-            )
-            stats    = pf.stats()
-            pfactor  = stats.get("Profit Factor")    if "Profit Factor"    in stats.index else np.nan
-            ret      = stats.get("Total Return [%]") if "Total Return [%]" in stats.index else np.nan
-            max_dd   = stats.get("Max Drawdown [%]") if "Max Drawdown [%]" in stats.index else np.nan
-            n_trades = stats.get("Total Trades")     if "Total Trades"     in stats.index else 0
-            sharpe   = stats.get("Sharpe ratio")     if "Sharpe ratio"     in stats.index else np.nan
-            del pf
-
-            try:
-                ma_len_val = int(''.join(filter(str.isdigit, str(col))))
-            except Exception:
-                ma_len_val = col
-
-            results.append({
-                "ticker":        ticker,
-                "ma_len":        ma_len_val,
-                "atr_mult":      float(atr_mult),
-                "profit_factor": float(pfactor)  if not pd.isna(pfactor)  else np.nan,
-                "total_return":  float(ret)       if not pd.isna(ret)       else np.nan,
-                "max_drawdown":  float(max_dd)    if not pd.isna(max_dd)    else np.nan,
-                "n_trades":      int(n_trades)     if not pd.isna(n_trades)  else 0,
-                "sharpe":        float(sharpe)    if not pd.isna(sharpe)    else np.nan,
-            })
-
-    del entries_df, ma_all, atr, close_arr, atr_arr
-    gc.collect()
-    return pd.DataFrame(results)
-
-
-def generate_wfo_windows(wfo_start, train_months, test_months):
-    """
-    產生所有 [train_start, train_end, test_start, test_end] 窗口
-    最後一個窗口的 test_end = today（用於今日建議）
-    """
-    today      = datetime.today().date()
-    start_date = datetime.strptime(wfo_start, "%Y-%m-%d").date()
-    windows    = []
-    cursor     = start_date
-
-    while True:
-        train_start = cursor
-        train_end   = cursor + relativedelta(months=train_months)
-        test_start  = train_end
-        test_end    = test_start + relativedelta(months=test_months)
-
-        if test_end > today:
-            # 最後一個窗口：test_end 設為 today
-            windows.append((
-                train_start.strftime("%Y-%m-%d"),
-                train_end.strftime("%Y-%m-%d"),
-                test_start.strftime("%Y-%m-%d"),
-                None   # None = 今天
-            ))
-            break
-
-        windows.append((
-            train_start.strftime("%Y-%m-%d"),
-            train_end.strftime("%Y-%m-%d"),
-            test_start.strftime("%Y-%m-%d"),
-            test_end.strftime("%Y-%m-%d"),
-        ))
-        cursor += relativedelta(months=test_months)
-
-    return windows
-
-
 # ================================================================
 #  主流程
 # ================================================================
 print("Python:", sys.version.splitlines()[0])
 print("vectorbt:", getattr(vbt, "__version__", "unknown"))
 print(f"Universe: {len(TICKERS)} tickers")
+print(f"Train: {TRAIN_START} ~ {TRAIN_END}  |  Test: {TEST_START} ~ today")
 
 # ----------------------------------------------------------------
 # Step 1: 市場狀態
 # ----------------------------------------------------------------
 print("\n[Step 1] Market regime...")
-_, _, _, spy_close = safe_download_series(SPY_TICKER, WFO_START)
+spy_df = safe_download(SPY_TICKER, TRAIN_START)
+_, _, _, spy_close, _ = extract_ohlcv(spy_df)
 market_regime  = get_market_regime(spy_close)
 ACTIVE_TICKERS = UNIVERSE["防禦"] if market_regime == "risk-off" else TICKERS
-print(f"  Regime: {market_regime.upper()}  |  Active tickers: {len(ACTIVE_TICKERS)}")
+print(f"  Regime: {market_regime.upper()}  |  Active: {len(ACTIVE_TICKERS)} tickers")
 
 # ----------------------------------------------------------------
-# Step 2: 相對動能，選 Top N
+# Step 2: 動能排名，選 Top N
 # ----------------------------------------------------------------
 print(f"\n[Step 2] Momentum ranking (window={MOMENTUM_WINDOW}d)...")
 momentum_scores = {}
 for ticker in ACTIVE_TICKERS:
-    _, _, _, close = safe_download_series(ticker,
-                         (datetime.today() - relativedelta(months=6)).strftime("%Y-%m-%d"))
+    df = safe_download(ticker, TEST_START)
+    _, _, _, close, _ = extract_ohlcv(df)
     momentum_scores[ticker] = compute_momentum_score(close, MOMENTUM_WINDOW)
+    del df
     gc.collect()
 
 sorted_tickers = sorted(
@@ -345,222 +392,180 @@ sorted_tickers = sorted(
     key=lambda x: x[1], reverse=True
 )
 top_tickers = [t for t, _ in sorted_tickers[:TOP_N_TICKERS]]
-print(f"  Top {TOP_N_TICKERS}: {top_tickers}")
-for t in top_tickers:
-    s = momentum_scores[t]
-    print(f"    {t}: {s:.1%}")
+print(f"  Top {TOP_N_TICKERS}: " + ", ".join(f"{t}({momentum_scores[t]:.1%})" for t in top_tickers))
 
 # ----------------------------------------------------------------
-# Step 3: 產生 WFO 窗口
+# Step 3: Train param grid
 # ----------------------------------------------------------------
-windows = generate_wfo_windows(WFO_START, WFO_TRAIN_MONTHS, WFO_TEST_MONTHS)
-print(f"\n[Step 3] WFO windows: {len(windows)} total  "
-      f"(train={WFO_TRAIN_MONTHS}m, test={WFO_TEST_MONTHS}m)")
-for i, (ts, te, vs, ve) in enumerate(windows):
-    flag = " ← LIVE (今日建議用)" if ve is None else ""
-    print(f"  Window {i+1:02d}: train {ts}~{te}  test {vs}~{ve or 'today'}{flag}")
-
-# ----------------------------------------------------------------
-# Step 4: 對每個 ticker 跑 WFO
-# ----------------------------------------------------------------
-print(f"\n[Step 4] Running WFO for top {TOP_N_TICKERS} tickers...")
-
-# wfo_records: 儲存所有窗口的 test 結果，用於統計
-wfo_records = []
-
-# live_params: 最後一個窗口的最佳參數（今日建議用）
-live_params = {}
-
-for ticker in tqdm(top_tickers, desc="Tickers"):
-    # 一次下載整段資料，各窗口切片使用，減少 API 呼叫
-    _, high_full, low_full, close_full = safe_download_series(ticker, WFO_START)
-    if close_full is None or len(close_full) < 100:
-        print(f"  Skip {ticker}: no data")
+print(f"\n[Step 3] Train param grid ({TRAIN_START} ~ {TRAIN_END})...")
+train_all = []
+for ticker in tqdm(top_tickers, desc="Train"):
+    df = safe_download(ticker, TRAIN_START, TRAIN_END)
+    open_s, high_s, low_s, close, vol = extract_ohlcv(df)
+    if close is None or len(close) < 80:
+        print(f"  Skip {ticker}: insufficient data")
         continue
-
-    ticker_window_results = []
-
-    for win_idx, (train_s, train_e, test_s, test_e) in enumerate(windows):
-        is_live = (test_e is None)
-
-        # 切片
-        train_close = close_full.loc[train_s:train_e]
-        train_high  = high_full.loc[train_s:train_e]  if high_full  is not None else None
-        train_low   = low_full.loc[train_s:train_e]   if low_full   is not None else None
-
-        if len(train_close) < 60:
-            continue
-
-        # 訓練：找最佳參數
-        train_df = run_param_grid(ticker, train_close, train_high, train_low,
-                                  MA_LENS, ATR_MULTS)
-        if train_df.empty:
-            continue
-
-        best_row = train_df.sort_values("profit_factor", ascending=False).iloc[0]
-        best_ma  = int(best_row["ma_len"])
-        best_atr = float(best_row["atr_mult"])
-
-        # 測試：用最佳參數跑 test 期間
-        test_close = close_full.loc[test_s:]       if is_live else close_full.loc[test_s:test_e]
-        test_high  = high_full.loc[test_s:]        if is_live else high_full.loc[test_s:test_e]
-        test_low   = low_full.loc[test_s:]         if is_live else low_full.loc[test_s:test_e]
-
-        if len(test_close) < 10:
-            continue
-
-        test_df = run_param_grid(ticker, test_close, test_high, test_low,
-                                 [best_ma], [best_atr])
-        if test_df.empty:
-            continue
-
-        test_pf  = float(test_df.iloc[0]["profit_factor"])
-        test_ret = float(test_df.iloc[0]["total_return"])
-
-        wfo_records.append({
-            "ticker":    ticker,
-            "window":    win_idx + 1,
-            "is_live":   is_live,
-            "train_s":   train_s,
-            "train_e":   train_e,
-            "test_s":    test_s,
-            "test_e":    test_e or "today",
-            "best_ma":   best_ma,
-            "best_atr":  best_atr,
-            "train_pf":  float(best_row["profit_factor"]),
-            "test_pf":   test_pf,
-            "test_ret":  test_ret,
-        })
-
-        ticker_window_results.append(test_pf)
-
-        # 最後一個窗口 → live params
-        if is_live:
-            live_params[ticker] = {
-                "ma_len":   best_ma,
-                "atr_mult": best_atr,
-                "train_pf": float(best_row["profit_factor"]),
-                "test_pf":  test_pf,
-                # WFO 平均 test PF（包含歷史窗口）
-                "avg_test_pf": float(np.nanmean(ticker_window_results)) if ticker_window_results else np.nan,
-                "n_windows":   len(ticker_window_results),
-            }
-
-    del close_full, high_full, low_full
+    results = run_param_grid(ticker, open_s, high_s, low_s, close, vol)
+    train_all.extend(results)
+    del df, open_s, high_s, low_s, close, vol
     gc.collect()
 
-# ----------------------------------------------------------------
-# Step 5: WFO 統計 & 過濾
-# ----------------------------------------------------------------
-wfo_df = pd.DataFrame(wfo_records)
-wfo_df.to_csv(WFO_CSV, index=False)
-print(f"\n[Step 5] WFO summary saved -> {WFO_CSV}")
+train_df = pd.DataFrame(train_all)
 
-print("\n  WFO avg test Profit Factor per ticker:")
-qualified_tickers = []
-for ticker, params in live_params.items():
-    avg_pf   = params["avg_test_pf"]
-    n_win    = params["n_windows"]
-    passed   = not pd.isna(avg_pf) and avg_pf >= MIN_AVG_TEST_PF
-    status   = "✅ PASS" if passed else "❌ FAIL"
-    print(f"    {ticker}: avg PF={avg_pf:.2f} over {n_win} windows  {status}")
-    if passed:
-        qualified_tickers.append(ticker)
-
-print(f"\n  Qualified: {qualified_tickers}")
-
-# ----------------------------------------------------------------
-# Step 6: 今日建議
-# ----------------------------------------------------------------
-print("\n[Step 6] Generating today's recommendations...")
-recommendations = []
-today_start = (datetime.today() - relativedelta(months=WFO_TRAIN_MONTHS + 1)).strftime("%Y-%m-%d")
-
-for ticker in qualified_tickers:
-    params   = live_params[ticker]
-    best_ma  = params["ma_len"]
-    best_atr = params["atr_mult"]
-
-    _, high_s, low_s, close = safe_download_series(ticker, today_start)
-    if close is None or len(close) < 60:
+# 每檔取最佳參數（PF 最高且交易次數 >= MIN_TRADES）
+best_params = {}
+for ticker in top_tickers:
+    sub = train_df[
+        (train_df["ticker"] == ticker) &
+        (train_df["n_trades"] >= MIN_TRADES)
+    ].sort_values("profit_factor", ascending=False)
+    if sub.empty:
+        print(f"  {ticker}: no valid combos in train (all < {MIN_TRADES} trades)")
         continue
+    best = sub.iloc[0]
+    best_params[ticker] = {
+        "trend_ma":   int(best["trend_ma"]),
+        "vol_mult":   float(best["vol_mult"]),
+        "body_ratio": float(best["body_ratio"]),
+        "close_top":  float(best["close_top"]),
+        "atr_mult":   float(best["atr_mult"]),
+        "train_pf":   float(best["profit_factor"]),
+        "train_trades": int(best["n_trades"]),
+    }
+    print(f"  {ticker}: MA{best_params[ticker]['trend_ma']} "
+          f"vol>{best_params[ticker]['vol_mult']}x "
+          f"body>{best_params[ticker]['body_ratio']:.0%} "
+          f"ATR×{best_params[ticker]['atr_mult']}  "
+          f"→ Train PF={best_params[ticker]['train_pf']:.2f} "
+          f"({best_params[ticker]['train_trades']} trades)")
 
-    volume   = safe_download_volume(ticker, today_start)
-    vol_ma20 = volume.rolling(20).mean() if volume is not None else None
+# ----------------------------------------------------------------
+# Step 4: Test 驗證
+# ----------------------------------------------------------------
+print(f"\n[Step 4] Test validation ({TEST_START} ~ today)...")
+qualified = {}
+for ticker, params in tqdm(best_params.items(), desc="Test"):
+    df = safe_download(ticker, TEST_START)
+    open_s, high_s, low_s, close, vol = extract_ohlcv(df)
+    if close is None or len(close) < 30:
+        continue
 
     atr_run = vbt.ATR.run(high_s, low_s, close, window=ATR_LEN)
     atr = try_attr(atr_run, ["atr", "real", "value", "output"])
     if isinstance(atr, pd.DataFrame): atr = atr.iloc[:, 0]
     atr = atr.reindex(close.index)
 
-    ma_run = vbt.MA.run(close, window=best_ma, ewm=False)
-    ma_series = try_attr(ma_run, ["ma", "real", "value", "output"])
-    if isinstance(ma_series, pd.DataFrame): ma_series = ma_series.iloc[:, 0]
-    ma_series = ma_series.reindex(close.index)
-
-    long_ma_run = vbt.MA.run(close, window=LONG_MA_LEN, ewm=False)
-    long_ma = try_attr(long_ma_run, ["ma", "real", "value", "output"])
-    if isinstance(long_ma, pd.DataFrame): long_ma = long_ma.iloc[:, 0]
-    long_ma = long_ma.reindex(close.index)
-
-    entries = (close > ma_series) & (close.shift(1) <= ma_series.shift(1))
-    entries = entries.fillna(False).astype(bool)
-    entries &= (close > long_ma)
-
-    if vol_ma20 is not None:
-        vol_ma20    = vol_ma20.reindex(close.index)
-        vol_confirm = (volume.reindex(close.index) > vol_ma20 * 1.2).fillna(False)
-        entries    &= vol_confirm
-
-    trail_arr, exits_arr = compute_trail_numpy(
-        close.values, atr.values, entries.values, best_atr, MAX_HOLD_DAYS
+    entries = compute_entry_signals(
+        open_s, high_s, low_s, close, vol,
+        params["trend_ma"], params["vol_mult"],
+        params["body_ratio"], params["close_top"]
     )
-    exits = pd.Series(exits_arr, index=close.index)
-    trail = pd.Series(trail_arr, index=close.index)
+    _, exits = compute_exit_signals(
+        open_s, high_s, low_s, close, vol,
+        atr, params["atr_mult"], entries
+    )
+
+    pf    = vbt.Portfolio.from_signals(
+        close=close, entries=entries, exits=exits,
+        init_cash=INIT_CASH, fees=COMMISSION,
+        size=SIZE_HACK_VALUE, direction="longonly", freq="1d"
+    )
+    stats    = pf.stats()
+    test_pf  = float(stats.get("Profit Factor")    if "Profit Factor"    in stats.index else np.nan)
+    test_ret = float(stats.get("Total Return [%]") if "Total Return [%]" in stats.index else np.nan)
+    n_trades = int(  stats.get("Total Trades")     if "Total Trades"     in stats.index else 0)
+    del pf
+
+    passed = (not pd.isna(test_pf)) and test_pf >= MIN_TEST_PF and n_trades >= MIN_TRADES
+    status = "✅ PASS" if passed else "❌ FAIL"
+    print(f"  {ticker}: test PF={test_pf:.2f}, trades={n_trades}  {status}")
+
+    if passed:
+        params["test_pf"]     = test_pf
+        params["test_return"] = test_ret
+        params["test_trades"] = n_trades
+        # 保留最新的指標物件用於今日建議
+        params["_close"]   = close
+        params["_open"]    = open_s
+        params["_high"]    = high_s
+        params["_low"]     = low_s
+        params["_vol"]     = vol
+        params["_atr"]     = atr
+        params["_entries"] = entries
+        params["_exits"]   = exits
+        qualified[ticker]  = params
+
+    del df, open_s, high_s, low_s, close, vol, atr, entries, exits
+    gc.collect()
+
+print(f"\n  Qualified: {list(qualified.keys())}")
+
+# ----------------------------------------------------------------
+# Step 5: 今日建議
+# ----------------------------------------------------------------
+print("\n[Step 5] Generating recommendations...")
+recommendations = []
+
+for ticker, params in qualified.items():
+    close   = params["_close"]
+    open_s  = params["_open"]
+    high_s  = params["_high"]
+    atr     = params["_atr"]
+    entries = params["_entries"]
+    exits   = params["_exits"]
+    trail, _ = compute_exit_signals(
+        open_s, high_s, params["_low"], close, params["_vol"],
+        atr, params["atr_mult"], entries
+    )
 
     in_pos_now, last_entry = compute_in_position(entries, exits)
-    last_close   = float(close.iloc[-1])
-    ma_last      = float(ma_series.iloc[-1]) if not pd.isna(ma_series.iloc[-1]) else None
-    long_ma_last = float(long_ma.iloc[-1])   if not pd.isna(long_ma.iloc[-1])   else None
-    last_trail   = float(trail.dropna().iloc[-1]) if trail.dropna().shape[0] > 0 else None
+    last_close  = float(close.iloc[-1])
+    last_trail  = float(trail.dropna().iloc[-1]) if trail.dropna().shape[0] > 0 else None
     momentum_pct = momentum_scores.get(ticker, np.nan)
 
     if in_pos_now:
         action       = "HOLD"
-        stop_or_rule = f"Stop: {last_trail:.2f}" if last_trail else "—"
+        stop_or_rule = f"ATR Stop: {last_trail:.2f}" if last_trail else "—"
     elif entries.iloc[-1]:
-        action       = "BUY"
-        init_stop    = close.iloc[-1] - atr.iloc[-1] * best_atr
-        stop_or_rule = f"Stop: {init_stop:.2f}" if not pd.isna(atr.iloc[-1]) else "—"
+        action      = "BUY"
+        init_stop   = last_close - float(atr.iloc[-1]) * params["atr_mult"]
+        stop_or_rule = f"Init Stop: {init_stop:.2f}"
     else:
-        action = "WAIT"
-        cond   = f"Buy if close > {ma_last:.2f}" if ma_last else ""
-        if long_ma_last:
-            cond += f" & > LongMA {long_ma_last:.2f}"
-        stop_or_rule = cond or "—"
+        action       = "WAIT"
+        stop_or_rule = (
+            f"需要: close>{params['trend_ma']}MA, "
+            f"vol>{params['vol_mult']}×avgVol, "
+            f"強勢K棒"
+        )
 
     recommendations.append({
         "Ticker":        ticker,
         "Action":        action,
         "Last Close":    round(last_close, 2),
         "Momentum 60d":  f"{momentum_pct:.1%}" if not pd.isna(momentum_pct) else "—",
-        "MA":            best_ma,
-        "ATR x":         best_atr,
-        "Avg WFO PF":    round(params["avg_test_pf"], 2),
-        "Live Test PF":  round(params["test_pf"], 2),
-        "# Windows":     params["n_windows"],
+        "Trend MA":      params["trend_ma"],
+        "Vol Mult":      params["vol_mult"],
+        "Body Ratio":    f"{params['body_ratio']:.0%}",
+        "ATR x":         params["atr_mult"],
+        "Train PF":      round(params["train_pf"], 2),
+        "Test PF":       round(params["test_pf"], 2),
+        "Test Trades":   params["test_trades"],
         "Stop / Rule":   stop_or_rule,
         "In Position":   "Yes" if in_pos_now else "No",
         "Last Entry":    str(last_entry.date()) if last_entry else "—",
         "Market":        market_regime,
     })
 
-    del high_s, low_s, close, atr, ma_series, long_ma, entries, exits, trail
-    gc.collect()
+# ----------------------------------------------------------------
+# Step 6: 儲存 + HTML
+# ----------------------------------------------------------------
+if not recommendations:
+    print("\n⚠️  No qualified tickers. Writing empty output.")
+    pd.DataFrame().to_csv(RECOMMEND_CSV, index=False)
+    with open(HTML_BODY_FILE, "w", encoding="utf-8") as f:
+        f.write("<html><body><p>No recommendations today. All tickers failed PF threshold.</p></body></html>")
+    sys.exit(0)
 
-# ----------------------------------------------------------------
-# Step 7: 儲存 + HTML 信件
-# ----------------------------------------------------------------
 rec_df = pd.DataFrame(recommendations)
 action_order = {"BUY": 0, "HOLD": 1, "WAIT": 2}
 rec_df["_sort"] = rec_df["Action"].map(action_order).fillna(3)
@@ -571,10 +576,9 @@ print("\n" + "="*75)
 print(rec_df.to_string(index=False))
 print("="*75)
 print(f"Market: {market_regime.upper()}")
-print(f"Saved recommendations -> {RECOMMEND_CSV}")
-print(f"Saved WFO summary     -> {WFO_CSV}")
+print(f"Saved -> {RECOMMEND_CSV}")
 
-# HTML
+# HTML 信件
 ACTION_COLOR = {"BUY": "#d4edda", "HOLD": "#fff3cd", "WAIT": "#f8f9fa"}
 rows_html = ""
 for r in recommendations:
@@ -585,11 +589,13 @@ for r in recommendations:
       <td><b>{r['Action']}</b></td>
       <td>{r['Last Close']}</td>
       <td>{r['Momentum 60d']}</td>
-      <td>{r['MA']}</td>
+      <td>{r['Trend MA']}</td>
+      <td>{r['Vol Mult']}</td>
+      <td>{r['Body Ratio']}</td>
       <td>{r['ATR x']}</td>
-      <td>{r['Avg WFO PF']}</td>
-      <td>{r['Live Test PF']}</td>
-      <td>{r['# Windows']}</td>
+      <td>{r['Train PF']}</td>
+      <td>{r['Test PF']}</td>
+      <td>{r['Test Trades']}</td>
       <td>{r['Stop / Rule']}</td>
       <td>{r['In Position']}</td>
       <td>{r['Last Entry']}</td>
@@ -600,35 +606,31 @@ today_str    = datetime.now().strftime("%Y-%m-%d")
 
 html_body = f"""
 <html><body style="font-family:Arial;padding:16px">
-<h2>📈 Daily Trading Recommendations — {today_str}</h2>
+<h2>📈 Daily Recommendations — {today_str}</h2>
 <p>
-  Market Regime:
-  <span style="background:{regime_color};padding:3px 10px;border-radius:4px">
-    <b>{market_regime.upper()}</b>
-  </span>
-  &nbsp;|&nbsp; WFO: train={WFO_TRAIN_MONTHS}m / test={WFO_TEST_MONTHS}m
-  &nbsp;|&nbsp; Min avg WFO PF: {MIN_AVG_TEST_PF}
+  Market: <span style="background:{regime_color};padding:3px 10px;border-radius:4px"><b>{market_regime.upper()}</b></span>
   &nbsp;|&nbsp; Top {TOP_N_TICKERS} by {MOMENTUM_WINDOW}d momentum
+  &nbsp;|&nbsp; Min Test PF: {MIN_TEST_PF}
 </p>
 <table border="1" cellpadding="6" cellspacing="0"
-       style="border-collapse:collapse;font-size:13px">
+       style="border-collapse:collapse;font-size:12px">
   <thead>
     <tr style="background:#343a40;color:white">
       <th>Ticker</th><th>Action</th><th>Last Close</th>
-      <th>Momentum 60d</th><th>MA</th><th>ATR x</th>
-      <th>Avg WFO PF</th><th>Live Test PF</th><th># Windows</th>
-      <th>Stop / Rule</th><th>In Position</th><th>Last Entry</th>
+      <th>Momentum</th><th>Trend MA</th><th>Vol Mult</th><th>Body Ratio</th>
+      <th>ATR x</th><th>Train PF</th><th>Test PF</th><th>Trades</th>
+      <th>Stop / Rule</th><th>In Pos</th><th>Last Entry</th>
     </tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
-<p style="font-size:12px;color:gray;margin-top:12px">
-  BUY=<span style="background:#d4edda;padding:2px 6px">green</span> &nbsp;
-  HOLD=<span style="background:#fff3cd;padding:2px 6px">yellow</span> &nbsp;
+<p style="font-size:11px;color:gray;margin-top:12px">
+  進場條件：Trend MA向上 + 爆量(Vol Mult×) + 強勢K棒(Body Ratio) + 收在高點<br>
+  出場條件：ATR trailing stop 或 K線反轉（射擊之星/吞噬/縮量陰線×{WEAK_VOL_DAYS}）<br>
+  BUY=<span style="background:#d4edda;padding:2px 6px">green</span>
+  HOLD=<span style="background:#fff3cd;padding:2px 6px">yellow</span>
   WAIT=<span style="background:#f8f9fa;padding:2px 6px">gray</span><br>
-  <b>Avg WFO PF</b>: 所有歷史測試窗口的平均 Profit Factor（越高越穩定）<br>
-  <b>Live Test PF</b>: 最近一個測試窗口的 Profit Factor<br>
-  ⚠️ 僅供參考，不構成投資建議。過去績效不代表未來表現。
+  ⚠️ 僅供參考，不構成投資建議。
 </p>
 </body></html>
 """
@@ -636,5 +638,5 @@ html_body = f"""
 with open(HTML_BODY_FILE, "w", encoding="utf-8") as f:
     f.write(html_body)
 
-print(f"Saved HTML email      -> {HTML_BODY_FILE}")
+print(f"Saved HTML -> {HTML_BODY_FILE}")
 print("Done.")
