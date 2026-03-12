@@ -53,15 +53,8 @@ jobs:
           server_port:    ${{ secrets.SMTP_PORT }}
           username:       ${{ secrets.SMTP_USERNAME }}
           password:       ${{ secrets.SMTP_PASSWORD }}
-          subject:        "Daily Trading Recommendations - ${{ github.run_id }}"
+          subject:        "📈 Daily Trading Recommendations - ${{ github.run_id }}"
           to:             ${{ secrets.EMAIL_TO }}
           from:           ${{ secrets.SMTP_USERNAME }}
-          body: |
-            Hi,
-
-            Attached is today's trading recommendation table (CSV).
-
-            Repo : ${{ github.repository }}
-            Run  : ${{ github.run_id }}
-          attachments: ${{ env.OUT_DIR }}/recommendations.csv
+          html_body:      file://${{ env.OUT_DIR }}/email_body.html
           secure: true
