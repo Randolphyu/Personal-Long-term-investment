@@ -293,4 +293,52 @@ print("\n" + "="*60)
 print(rec_df.to_string(index=False))
 print("="*60)
 print(f"\nSaved -> {RECOMMEND_CSV}")
+
+# -------------------- 產生 HTML 信件內文 --------------------
+ACTION_COLOR = {"BUY": "#d4edda", "HOLD": "#fff3cd", "WAIT": "#f8f9fa"}
+
+rows_html = ""
+for r in recommendations:
+    color = ACTION_COLOR.get(r["Action"], "#ffffff")
+    rows_html += f"""
+    <tr style="background:{color}">
+      <td><b>{r['Ticker']}</b></td>
+      <td><b>{r['Action']}</b></td>
+      <td>{r['Last Close']}</td>
+      <td>{r['MA']}</td>
+      <td>{r['ATR x']}</td>
+      <td>{r['Profit Factor']}</td>
+      <td>{r['Stop / Rule']}</td>
+      <td>{r['In Position']}</td>
+      <td>{r['Last Entry']}</td>
+    </tr>"""
+
+html_body = f"""
+<html><body>
+<h2 style="font-family:Arial">📈 Daily Trading Recommendations</h2>
+<table border="1" cellpadding="6" cellspacing="0"
+       style="border-collapse:collapse;font-family:Arial;font-size:14px">
+  <thead>
+    <tr style="background:#343a40;color:white">
+      <th>Ticker</th><th>Action</th><th>Last Close</th>
+      <th>MA</th><th>ATR x</th><th>Profit Factor</th>
+      <th>Stop / Rule</th><th>In Position</th><th>Last Entry</th>
+    </tr>
+  </thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<p style="font-family:Arial;font-size:12px;color:gray">
+  Data as of {rec_df['Last Entry'].max() if not rec_df.empty else 'N/A'} &nbsp;|&nbsp;
+  BUY=<span style="background:#d4edda;padding:2px 6px">green</span> &nbsp;
+  HOLD=<span style="background:#fff3cd;padding:2px 6px">yellow</span> &nbsp;
+  WAIT=<span style="background:#f8f9fa;padding:2px 6px">gray</span>
+</p>
+</body></html>
+"""
+
+HTML_BODY_FILE = os.path.join(OUT_DIR, "email_body.html")
+with open(HTML_BODY_FILE, "w", encoding="utf-8") as f:
+    f.write(html_body)
+
+print(f"Saved HTML email body -> {HTML_BODY_FILE}")
 print("Done.")
