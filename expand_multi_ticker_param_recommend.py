@@ -31,7 +31,7 @@ TICKERS    = [t for g in UNIVERSE.values() for t in g]
 SPY_TICKER = "SPY"
 
 # --- Walk-Forward 設定 ---
-WFO_START        = "2023-01-01"   # 整個回測起點（要夠長才有足夠窗口）
+WFO_START        = "2020-01-01"   # 整個回測起點（要夠長才有足夠窗口）
 WFO_TRAIN_MONTHS = 12             # 每個訓練窗口長度（月）
 WFO_TEST_MONTHS  = 3              # 每個測試窗口長度（月）
 # 今日建議用的訓練窗口 = 最近 WFO_TRAIN_MONTHS 個月
